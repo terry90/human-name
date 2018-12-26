@@ -267,11 +267,6 @@ pub fn has_number(word: &str) -> bool {
     word.chars().any(char::is_numeric)
 }
 
-#[inline]
-pub fn has_alpha(word: &str) -> bool {
-    word.chars().any(char::is_alphabetic)
-}
-
 pub fn has_sequential_alphas(word: &str) -> bool {
     lazy_static! {
         static ref RE: Regex = Regex::new(r"\p{Alphabetic}{2,}").unwrap();

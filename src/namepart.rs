@@ -2,7 +2,9 @@ use super::namecase;
 use super::surname;
 use super::utils::*;
 use phf;
+use regex::{Matches, Regex};
 use std::borrow::Cow;
+use std::iter::Peekable;
 use unicode_segmentation::UnicodeSegmentation;
 
 // If Start and End overlap, use End
@@ -15,8 +17,10 @@ pub enum Location {
 
 pub struct NameParts<'a> {
     text: &'a str,
+    current_word: &'a str,
     trust_capitalization: bool,
     location: Location,
+    matches: Peekable<Matches<'static, 'a>>,
 }
 
 impl<'a> NameParts<'a> {
@@ -35,8 +39,17 @@ impl<'a> NameParts<'a> {
         }
     }
 
-    fn at_end(&self) -> bool {
-        !has_alpha(self.text)
+    fn at_end(&mut self) -> bool {
+        self.current_word.is_empty() && self.matches.peek().is_none()
+    }
+
+    fn name_part(&mut self, word: &'a str, counts: CharacterCounts) -> NamePart<'a> {
+        NamePart::from_word_and_counts(
+            word,
+            counts,
+            self.trust_capitalization,
+            self.next_location(),
+        )
     }
 }
 
@@ -52,61 +65,60 @@ static AMPERSAND: NamePart = NamePart {
     category: Category::Other,
 };
 
+const SPACE_OR_PERIOD: &[char] = &[' ', '.'];
+
 impl<'a> Iterator for NameParts<'a> {
     type Item = NamePart<'a>;
 
     fn next(&mut self) -> Option<NamePart<'a>> {
-        // Skip any leading whitespace
-        self.text = self.text.trim_start();
-
-        if self.text.is_empty() {
-            return None;
+        if !self.current_word.is_empty() {
+            if let Some((start, subword, counts)) = self
+                .current_word
+                .split_word_bound_indices()
+                .map(|(start, subword)| (start, subword, categorize_chars(subword)))
+                .find(|(_, _, counts)| counts.alpha > 0)
+            {
+                self.current_word = &self.current_word[start + subword.len()..];
+                return Some(self.name_part(subword, counts));
+            } else {
+                self.current_word = "";
+            }
         }
 
-        // Now look for the next whitespace that remains
-        let next_whitespace = self.text.find(' ').unwrap_or_else(|| self.text.len());
-        let next_inner_period = self.text[0..next_whitespace].find('.');
-        let next_boundary = match next_inner_period {
-            Some(i) => i + 1,
-            None => next_whitespace,
-        };
-
-        let word = &self.text[0..next_boundary];
-        if word.len() > u8::max_value() as usize {
-            self.text = &self.text[next_boundary..];
-            self.next()
-        } else if word == "&" {
-            // Special case: only allowed word without alphabetical characters
-            self.text = &self.text[next_boundary..];
-            Some(AMPERSAND.clone())
-        } else {
-            let counts = categorize_chars(word);
-
-            if counts.alpha == 0 {
-                // Not a word, skip it by recursing
-                self.text = &self.text[next_boundary..];
-                self.next()
-            } else if counts.ascii_alpha == 0 {
-                // For non-ASCII, we defer to the unicode_segmentation library
-                let (next_word_boundary, subword) = word
-                    .split_word_bound_indices()
-                    .find(|&(_, subword)| has_alpha(subword))
-                    .unwrap();
-                self.text = &self.text[next_word_boundary + subword.len()..];
-                Some(NamePart::from_word(
-                    subword,
-                    self.trust_capitalization,
-                    self.next_location(),
-                ))
+        let maybe_word = self.matches.next().map(|m| {
+            let start = if m.as_str().starts_with(SPACE_OR_PERIOD) {
+                m.start() + 1
             } else {
-                // For ASCII, we split on whitespace and periods only
-                self.text = &self.text[next_boundary..];
-                Some(NamePart::from_word_and_counts(
-                    word,
-                    counts,
-                    self.trust_capitalization,
-                    self.next_location(),
-                ))
+                m.start()
+            };
+            let end = if m.as_str().ends_with(' ') {
+                m.end() - 1
+            } else {
+                m.end()
+            };
+            &self.text[start..end]
+        });
+
+        match maybe_word {
+            None => None,
+            Some(too_long) if too_long.len() > u8::max_value() as usize => self.next(),
+            Some("&") => {
+                if self.next_location() == Location::Middle {
+                    Some(AMPERSAND.clone())
+                } else {
+                    self.next()
+                }
+            }
+            Some(word) => {
+                let counts = categorize_chars(word);
+                if counts.ascii_alpha == 0 {
+                    // For completely non-ASCII words (likely something like Hangul),
+                    // we defer to the unicode_segmentation library
+                    self.current_word = word;
+                    self.next()
+                } else {
+                    Some(self.name_part(word, counts))
+                }
             }
         }
     }
@@ -129,10 +141,17 @@ pub struct NamePart<'a> {
 
 impl<'a> NamePart<'a> {
     pub fn all_from_text(text: &str, trust_capitalization: bool, location: Location) -> NameParts {
+        lazy_static! {
+            static ref RE: Regex =
+                Regex::new(r"(?:\b\w*\p{Alphabetic}[^ .]*(?:$|[ .]))|&").unwrap();
+        }
+
         NameParts {
             text,
+            current_word: "",
             trust_capitalization,
             location,
+            matches: RE.find_iter(text).peekable(),
         }
     }
 
@@ -155,7 +174,7 @@ impl<'a> NamePart<'a> {
             ascii_vowels,
         } = counts;
 
-        debug_assert!(alpha > 0);
+        debug_assert!(alpha > 0 || word == "&", format!("{}", word));
 
         let all_upper = alpha == upper;
 
